@@ -10,6 +10,10 @@ import heapq
 import json
 from pathlib import Path
 import re
+import time
+from replay import all_pass
+
+from value_profiles import Profiles
 
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -176,6 +180,8 @@ class Impact:
             self.by_file[row["file"]] |= 1 << idx
             self.all |= 1 << idx
         self.unmeasured = self.all & ~masks[data["complete"]]
+        profile_path = index.with_name("profiles.json")
+        self.profiles = Profiles(profile_path, data["tests"], source) if profile_path.is_file() else None
 
     @lru_cache(maxsize=64)
     def model(self, path):
@@ -340,6 +346,10 @@ class Impact:
             return readers
         if len(edit.new_lines) + len(edit.touched) > 240:
             return self.all
+        if self.profiles and edit.touched and not edit.insertions:
+            measured = self.profiles.impact(path, src, changed, edit.touched, self.imports.get(path, {}))
+            if measured is not None:
+                return readers | measured | self.unmeasured | (self.all & ~self.profiles.complete)
         new_ops = self.import_operations(changed, edit.new_lines)
         if new_ops and new_ops - self.import_operations(src.tree, edit.touched):
             return self.all
@@ -397,13 +407,30 @@ def main():
     parser.add_argument("--data", type=Path, default=Path("/data"))
     parser.add_argument("--source", type=Path, default=Path("/opt/sqlglot"))
     parser.add_argument("--index", type=Path, default=Path(__file__).parent / "maps/coverage.json")
+    parser.add_argument("--replay", action="store_true", help="execute cheap candidates on trusted changes")
     args = parser.parse_args()
     tests = json.loads((args.data / "tests.json").read_bytes())["tests"]
     impact = Impact(args.source, args.index, tests)
     times = {row["number"]: round(row["seconds"] * 1000) for row in tests}
-    for patch in sorted((args.data / "commits").glob("*.patch")):
+    names = {t["number"]: t["id"] for t in tests}
+    patches = sorted((args.data / "commits").glob("*.patch"))
+    budget = min(16.0, len(patches) * 0.28)
+    for patch in patches:
         try:
-            numbers = impact.choose(patch.read_text(encoding="utf-8"))
+            text = patch.read_text(encoding="utf-8")
+            numbers = impact.choose(text)
+            if (args.replay and budget > 0.5 and 0 < len(numbers) <= 45
+                    and sum(times[n] for n in numbers) <= 650
+                    and all(names[n].startswith("tests/dialects/") for n in numbers)):
+                start = time.monotonic()
+                try:
+                    edits = parse_patch(text)
+                    if all_pass(args.source, edits, [names[n] for n in sorted(numbers, key=times.get)],
+                                min(budget, 1.75)):
+                        numbers = []
+                except (OSError, ValueError, RecursionError):
+                    pass
+                budget -= time.monotonic() - start
         except UnicodeError:
             numbers = list(times)
         print(json.dumps({"commit": patch.stem, "workers": schedule(numbers, times)}, separators=(",", ":")))

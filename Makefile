@@ -30,8 +30,9 @@ sample: build $(KIT)/score.py
 
 sample-native: $(KIT)/score.py
 	mkdir -p "$(dir $(OUTPUT))"
-	$(PYTHON) selector.py --source "$(SOURCE)" --data "$(SAMPLE)" > "$(OUTPUT)"
+	$(PYTHON) selector.py --replay --source "$(SOURCE)" --data "$(SAMPLE)" > "$(OUTPUT)"
 	$(PYTHON) "$(KIT)/score.py" "$(SAMPLE)" "$(SAMPLE)/answers.json" "$(OUTPUT)"
 
 index: $(KIT)/score.py
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_index.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/coverage.json
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_profiles.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/profiles.json

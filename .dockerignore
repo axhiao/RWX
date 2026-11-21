@@ -2,3 +2,6 @@
 !selector.py
 !maps/
 !maps/coverage.json
+!value_profiles.py
+!replay.py
+!maps/profiles.json

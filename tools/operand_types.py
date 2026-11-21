@@ -48,17 +48,22 @@ class InstrumentedLoader(importlib.machinery.SourceFileLoader):
         tree = ast.parse(self.get_data(self.path), self.path)
         marker = fullname.replace(".", "/")
         relative = marker + ("/__init__.py" if self.path.endswith("/__init__.py") else ".py")
-        tree = Probe(relative).visit(tree)
+        tree = self.probe(relative).visit(tree)
         return compile(ast.fix_missing_locations(tree), self.path, "exec")
 
 
 class SQLGlotFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, probe=Probe, packages=("sqlglot",)):
+        self.probe = probe
+        self.packages = packages
+
     def find_spec(self, fullname, path, target=None):
-        if fullname != "sqlglot" and not fullname.startswith("sqlglot."):
+        if fullname.partition(".")[0] not in self.packages:
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
             spec.loader = InstrumentedLoader(fullname, spec.origin)
+            spec.loader.probe = self.probe
         return spec
 
 
