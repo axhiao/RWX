@@ -32,6 +32,21 @@ def evaluate(record):
     raise ValueError("unknown checkpoint")
 
 
+def evaluate_calls(records, calls, costs, limit=3200):
+    different = set()
+    for i, owners in calls:
+        inputs, expected = records[i]
+        try:
+            matches = digest(evaluate(inputs)) == expected
+        except Exception:
+            matches = False
+        if not matches:
+            different.update(owners)
+            if sum(costs[q] for q in different) > limit:
+                return None
+    return sorted(different)
+
+
 def local_expression_change(model, edited, lines):
     """Permit changes to operators and literals in existing function expressions."""
     def skeleton(node):
@@ -90,17 +105,6 @@ if __name__ == "__main__":
     sys.path.insert(0, root)
     with gzip.open(data, "rt") as stream:
         records = json.load(stream)
-    different = set()
     calls, costs = json.loads(Path(request).read_bytes())
-    for i, owners in calls:
-        inputs, expected = records[i]
-        try:
-            matches = digest(evaluate(inputs)) == expected
-        except Exception:
-            matches = False
-        if not matches:
-            different.update(owners)
-            if sum(costs[q] for q in different) > 3200:
-                Path(receipt).write_text("null")
-                sys.exit(0)
-    Path(receipt).write_text(json.dumps(sorted(different)))
+    result = evaluate_calls(records, calls, costs)
+    Path(receipt).write_text("null" if result is None else json.dumps(result))

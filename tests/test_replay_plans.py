@@ -7,7 +7,7 @@ import unittest
 
 from checkpoints import local_expression_change
 from dialect_state import StateCoverage, eligible
-from replay import verify
+from replay import verify, verify_commit, warmup
 from selector import Source, parse_patch
 from test_selector import patch
 
@@ -65,6 +65,25 @@ class ReplayPlanTests(unittest.TestCase):
         self.assertEqual(verify(self.root, edits, ids, {}, 3), {ids[0]})
         spec.write_text(spec.read_text() + "    @classmethod\n    def tearDownClass(cls): raise RuntimeError()\n")
         self.assertEqual(verify(self.root, edits, ids, {}, 3), set())
+
+    def test_fork_timeout_and_stdout_isolation(self):
+        warmup()
+        for directory in ("tests", "sqlglot"):
+            (self.root / directory).mkdir()
+            (self.root / directory / "__init__.py").touch()
+        (self.root / "sqlglot/item.py").write_text("value = 1\n")
+        (self.root / "tests/t.py").write_text(
+            "import time, unittest\nfrom sqlglot.item import value\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_noisy(self):\n"
+            "        print('SHOULD_NOT_LEAK_TO_STDOUT', flush=True)\n"
+            "        self.assertEqual(value, 2)\n"
+            "    def test_hang(self):\n"
+            "        time.sleep(5)\n")
+        edits = parse_patch(patch("sqlglot/item.py", "value = 1\n", "value = 2\n"))
+        self.assertEqual(verify_commit(self.root, edits, ["tests/t.py::T::test_noisy"], {}, 2.0),
+                         {"tests/t.py::T::test_noisy"})
+        self.assertEqual(verify_commit(self.root, edits, ["tests/t.py::T::test_hang"], {}, 0.15), set())
 
 
 if __name__ == "__main__":

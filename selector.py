@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import re
 import time
-from replay import verify, patched_state, changed_queries
+from replay import verify_commit, patched_state, warmup
 from checkpoints import Checkpoints, TPCDS
 from dialect_state import StateCoverage, eligible
 from query_replay import QueryCoverage
@@ -442,28 +442,24 @@ class Verifier:
         self.fixtures = read_optional("optimizer-fixtures", QueryCoverage)
         impact.state = read_optional("dialect-state", lambda p: StateCoverage(p, impact.test_ids))
 
-    def executor_cases(self, numbers, edits, deadline):
+    def executor_plan(self, numbers, edits, deadline):
         nodes = [self.names[n] for n in numbers]
         cases = self.queries.plan(self.impact, edits, nodes) if self.queries else {}
-        if not (self.checkpoints and self.queries and TPCDS in nodes and TPCDS not in cases):
-            return numbers, cases
-        indices = self.checkpoints.plan(self.impact, edits)
-        remaining = deadline - time.monotonic()
-        if indices and remaining > 0.5:
-            field, _, costs = self.queries.methods["test_execute_tpcds"]
-            calls = [(i, self.checkpoints.data["owners"][i]) for i in indices]
-            rows = changed_queries(self.impact.source, edits, self.inputs, calls, costs, min(4.0, remaining))
-            if rows == []:
-                numbers = [n for n in numbers if self.names[n] != TPCDS]
-            elif rows:
-                cases[TPCDS] = [field, rows]
-        return numbers, cases
+        tpcds_check = None
+        if self.checkpoints and self.queries and TPCDS in nodes and TPCDS not in cases:
+            indices = self.checkpoints.plan(self.impact, edits)
+            remaining = deadline - time.monotonic()
+            if indices and remaining > 0.5:
+                field, _, costs = self.queries.methods["test_execute_tpcds"]
+                calls = [(i, self.checkpoints.data["owners"][i]) for i in indices]
+                tpcds_check = (self.inputs, calls, costs, TPCDS, field)
+        return cases, tpcds_check
 
     def refine(self, numbers, text, deadline):
         edits = parse_patch(text)
         if not all(e.old == e.new and e.old.startswith("sqlglot/") and e.old.endswith(".py") for e in edits):
             return numbers
-        numbers, cases = self.executor_cases(numbers, edits, deadline)
+        cases, tpcds_check = self.executor_plan(numbers, edits, deadline)
         times, names = self.times, self.names
         total = sum(times[n] for n in numbers)
         # Class-table substitutions and copy flags can affect many callers
@@ -483,7 +479,8 @@ class Verifier:
             cases.update(slices)
             if slices and sum(times[n] for n in numbers if names[n] not in slices) < 1100:
                 nodes.extend(names[n] for n in numbers)
-        nodes = list(dict.fromkeys([*cases, *nodes]))
+        leading = [TPCDS] if tpcds_check else []
+        nodes = list(dict.fromkeys([*leading, *cases, *nodes]))
         if not nodes:
             return numbers
         potential = set(nodes)
@@ -492,8 +489,8 @@ class Verifier:
         remaining = deadline - time.monotonic()
         if gain < 450 or remaining < 0.35:
             return numbers
-        timeout = min(remaining, 4.5 if cases or total > 650 else 1.75)
-        passed = verify(self.impact.source, edits, nodes, cases, timeout)
+        timeout = min(remaining, 6.0 if tpcds_check else (4.5 if cases or total > 650 else 1.75))
+        passed = verify_commit(self.impact.source, edits, nodes, cases, timeout, tpcds_check=tpcds_check)
         return [n for n in numbers if names[n] not in passed]
 
 
@@ -509,7 +506,10 @@ def main():
     times = {row["number"]: round(row["seconds"] * 1000) for row in tests}
     names = {t["number"]: t["id"] for t in tests}
     patches = sorted((args.data / "commits").glob("*.patch"))
-    verifier = Verifier(args.index, impact, names, times) if args.replay else None
+    verifier = None
+    if args.replay:
+        warmup()
+        verifier = Verifier(args.index, impact, names, times)
     budget = min(48.0, max(12.0, len(patches) * 0.8))
     for patch in patches:
         try:
