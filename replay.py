@@ -1,5 +1,9 @@
 """Verify small candidate groups in an isolated checkout of the patched code."""
+import concurrent.futures as futures
+import pickle
 import importlib
+import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import signal
@@ -7,6 +11,23 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+
+class InlinePool(futures.Executor):
+    """Keep fixture queries submitted to process pools in the tracing process."""
+    def __init__(self, *args, initializer=None, initargs=(), **kwargs):
+        if initializer:
+            initializer(*initargs)
+
+    def submit(self, fn, /, *args, **kwargs):
+        result = futures.Future()
+        try:
+            work, a, kw = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            value = work(*a, **kw)
+            result.set_result(pickle.loads(pickle.dumps(value)))
+        except Exception as error:
+            result.set_exception(error)
+        return result
 
 
 def overlay(base, target, changes):
@@ -32,12 +53,13 @@ def overlay(base, target, changes):
             dest.write_text(changes[item.name], encoding="utf-8")
 
 
-def all_pass(source, edits, test_ids, timeout):
+@contextmanager
+def checkout(source, edits):
     changes = {}
     for edit in edits:
         if (not edit.old.startswith("sqlglot/") or not edit.old.endswith(".py")
                 or edit.old != edit.new):
-            return False
+            raise ValueError("verification requires modified production Python files")
         tree = changes
         *dirs, name = Path(edit.old).parts
         for directory in dirs:
@@ -49,35 +71,119 @@ def all_pass(source, edits, test_ids, timeout):
         env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
                "SKIP_INTEGRATION": "0", "PYTHONDONTWRITEBYTECODE": "1", "PYTHON_CPU_COUNT": "2",
                "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
-        receipt = Path(temp) / "passed"
-        proc = subprocess.Popen([sys.executable, __file__, str(root), str(receipt), *test_ids],
-                                cwd=root, env=env, start_new_session=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        yield root, env
+
+
+def child(script, root, env, extra, timeout):
+    proc = subprocess.Popen([sys.executable, str(script), str(root), *map(str, extra)],
+                            cwd=root, env=env, start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        return proc.wait(timeout=timeout) == 0
+    except subprocess.TimeoutExpired:
         try:
-            return proc.wait(timeout=timeout) == 0 and receipt.exists()
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-            return False
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        return False
 
 
-def run_tests(root, receipt, nodes):
+def patched_state(source, edits):
+    with checkout(source, edits) as (root, env):
+        result = root.parent / "state.json"
+        if child(Path(__file__).with_name("dialect_state.py"), root, env, [result], 2.5):
+            return json.loads(result.read_bytes())
+    return None
+
+
+def changed_queries(source, edits, data, calls, costs, timeout):
+    with checkout(source, edits) as (root, env):
+        request, receipt = root.parent / "calls.json", root.parent / "matched"
+        request.write_text(json.dumps([calls, costs]))
+        if child(Path(__file__).with_name("checkpoints.py"), root, env,
+                 [data.resolve(), request, receipt], timeout):
+            return json.loads(receipt.read_bytes())
+        return None
+
+
+def verify(source, edits, nodes, cases, timeout):
+    with checkout(source, edits) as (root, env):
+        request, result = root.parent / "request.json", root.parent / "passes.json"
+        request.write_text(json.dumps([nodes, cases]))
+        if child(__file__, root, env, [request, result], timeout):
+            return set(json.loads(result.read_bytes()))
+    return set()
+
+
+def all_pass(source, edits, test_ids, timeout):
+    return verify(source, edits, test_ids, {}, timeout) == set(test_ids)
+
+
+def run_tests(root, request, receipt):
     sys.path.insert(0, root)
-    suite = unittest.TestSuite()
+    nodes, cases = json.loads(Path(request).read_bytes())
+    # Preserve the serialization boundary of upstream pool tasks. Using an
+    # inline executor removes process startup from this local verification.
+    futures.ProcessPoolExecutor = InlinePool
+    groups = {}
     for node in nodes:
         file, cls, method = node.split("::")
-        mod = importlib.import_module(file[:-3].replace("/", "."))
-        suite.addTest(getattr(mod, cls)(method))
-    result = unittest.TestResult()
-    result.failfast = True
-    suite.run(result)
-    if (result.testsRun == len(nodes) and result.wasSuccessful() and
-            not (result.skipped or result.expectedFailures)):
-        Path(receipt).touch()
+        try:
+            mod = importlib.import_module(file[:-3].replace("/", "."))
+            if hasattr(mod, "setUpModule") or hasattr(mod, "tearDownModule"):
+                continue
+            groups.setdefault(getattr(mod, cls), []).append((node, method))
+        except (ImportError, AttributeError):
+            continue
+    passed = []
+    for cls, methods in groups.items():
+        group_passes = []
+        try:
+            cls.setUpClass()
+            try:
+                for node, method in methods:
+                    selection = cases.get(node)
+                    fixture_module = None
+                    field = None
+                    if isinstance(selection, dict):
+                        fixture_module = sys.modules[cls.__module__]
+                        loader = fixture_module.load_sql_fixture_pairs
+                        def load_subset(filename):
+                            pairs = list(loader(filename))
+                            if filename not in selection:
+                                return pairs
+                            count, indexes = selection[filename]
+                            if len(pairs) != count:
+                                raise ValueError("fixture index does not match the checkout")
+                            return [pairs[i] for i in indexes]
+                        fixture_module.load_sql_fixture_pairs = load_subset
+                    elif selection:
+                        field, ids = selection
+                    if field:
+                        original = getattr(cls, field)
+                        setattr(cls, field, [original[i] for i in ids])
+                    try:
+                        result = unittest.TestResult()
+                        result.failfast = True
+                        cls(method).run(result)
+                        if (result.testsRun == 1 and result.wasSuccessful() and not
+                                (result.skipped or result.expectedFailures)):
+                            group_passes.append(node)
+                    finally:
+                        if fixture_module:
+                            fixture_module.load_sql_fixture_pairs = loader
+                        if field:
+                            setattr(cls, field, original)
+            finally:
+                cls.tearDownClass()
+                cls.doClassCleanups()
+            if not getattr(cls, "tearDown_exceptions", []):
+                passed.extend(group_passes)
+        except Exception:
+            continue
+    Path(receipt).write_text(json.dumps(passed))
 
 
 if __name__ == "__main__":
-    run_tests(sys.argv[1], sys.argv[2], sys.argv[3:])
+    run_tests(*sys.argv[1:])

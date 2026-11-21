@@ -5,3 +5,11 @@
 !value_profiles.py
 !replay.py
 !maps/profiles.json
+!dialect_state.py
+!query_replay.py
+!maps/dialect-state.json.gz
+!maps/queries.json.gz
+!checkpoints.py
+!maps/call-inputs.json.gz
+!maps/call-sites.json.gz
+!maps/optimizer-fixtures.json.gz

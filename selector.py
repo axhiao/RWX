@@ -11,7 +11,10 @@ import json
 from pathlib import Path
 import re
 import time
-from replay import all_pass
+from replay import verify, patched_state, changed_queries
+from checkpoints import Checkpoints, TPCDS
+from dialect_state import StateCoverage, eligible
+from query_replay import QueryCoverage
 
 from value_profiles import Profiles
 
@@ -180,6 +183,8 @@ class Impact:
             self.by_file[row["file"]] |= 1 << idx
             self.all |= 1 << idx
         self.unmeasured = self.all & ~masks[data["complete"]]
+        self.test_ids = data["tests"]
+        self.state = None
         profile_path = index.with_name("profiles.json")
         self.profiles = Profiles(profile_path, data["tests"], source) if profile_path.is_file() else None
 
@@ -219,12 +224,13 @@ class Impact:
         # Module/class initializers can have import-wide effects.
         return self.all
 
-    def line_impact(self, path, src, line, insertion=False):
+    def line_impact(self, path, src, line, insertion=False, rows=None):
         chain = src.scope(line)
         func = next((n for n in chain if isinstance(n, FUNCTION)), None)
         if not func or line == func.lineno and not isinstance(func, ast.Lambda):
             return self.declaration(path, chain)
-        rows = self.lines.get(path, {})
+        if rows is None:
+            rows = self.lines.get(path, {})
         if insertion:
             return union(m for n, m in rows.items() if func.lineno <= n <= func.end_lineno)
         result = rows.get(line, 0)
@@ -346,10 +352,25 @@ class Impact:
             return readers
         if len(edit.new_lines) + len(edit.touched) > 240:
             return self.all
+        if (self.state and path.startswith("sqlglot/dialects/") and edit.touched and not edit.insertions
+                and eligible(src, changed, edit.touched)):
+            other = patched_state(self.source, [edit])
+            mask = self.state.impact(other) if other is not None else None
+            if mask is not None:
+                return readers | mask | self.unmeasured | (self.all & ~self.state.complete)
         if self.profiles and edit.touched and not edit.insertions:
             measured = self.profiles.impact(path, src, changed, edit.touched, self.imports.get(path, {}))
             if measured is not None:
                 return readers | measured | self.unmeasured | (self.all & ~self.profiles.complete)
+        # Some built-in dialects parse SQL while being imported. Missing
+        # required arguments there can prevent entire test modules loading.
+        # A key with an unresolved cold read has no per-test validation bound.
+        if path.startswith("sqlglot/expressions/"):
+            for line in edit.touched | {offset + 1 for offset in edit.insertions}:
+                for node in src.scope(line):
+                    if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "arg_types"
+                                                            for t in node.targets)):
+                        return self.all
         new_ops = self.import_operations(changed, edit.new_lines)
         if new_ops and new_ops - self.import_operations(src.tree, edit.touched):
             return self.all
@@ -402,6 +423,80 @@ def schedule(numbers, durations):
     return best
 
 
+def schedule_cost(numbers, times):
+    workers = schedule(numbers, times)
+    return 2000 * len(workers) + max((sum(times[n] for n in w) for w in workers), default=0)
+
+
+class Verifier:
+    def __init__(self, index, impact, names, times):
+        self.impact = impact
+        self.names = names
+        self.times = times
+        self.inputs = index.with_name("call-inputs.json.gz")
+        def read_optional(name, reader):
+            path = index.with_name(name + ".json.gz")
+            return reader(path) if path.is_file() else None
+        self.checkpoints = read_optional("call-sites", Checkpoints) if self.inputs.is_file() else None
+        self.queries = read_optional("queries", QueryCoverage)
+        self.fixtures = read_optional("optimizer-fixtures", QueryCoverage)
+        impact.state = read_optional("dialect-state", lambda p: StateCoverage(p, impact.test_ids))
+
+    def executor_cases(self, numbers, edits, deadline):
+        nodes = [self.names[n] for n in numbers]
+        cases = self.queries.plan(self.impact, edits, nodes) if self.queries else {}
+        if not (self.checkpoints and self.queries and TPCDS in nodes and TPCDS not in cases):
+            return numbers, cases
+        indices = self.checkpoints.plan(self.impact, edits)
+        remaining = deadline - time.monotonic()
+        if indices and remaining > 0.5:
+            field, _, costs = self.queries.methods["test_execute_tpcds"]
+            calls = [(i, self.checkpoints.data["owners"][i]) for i in indices]
+            rows = changed_queries(self.impact.source, edits, self.inputs, calls, costs, min(4.0, remaining))
+            if rows == []:
+                numbers = [n for n in numbers if self.names[n] != TPCDS]
+            elif rows:
+                cases[TPCDS] = [field, rows]
+        return numbers, cases
+
+    def refine(self, numbers, text, deadline):
+        edits = parse_patch(text)
+        if not all(e.old == e.new and e.old.startswith("sqlglot/") and e.old.endswith(".py") for e in edits):
+            return numbers
+        numbers, cases = self.executor_cases(numbers, edits, deadline)
+        times, names = self.times, self.names
+        total = sum(times[n] for n in numbers)
+        # Class-table substitutions and copy flags can affect many callers
+        # without changing their assertions. Their inexpensive groups are
+        # worth running even when they span more than one test module.
+        def class_value(e, line):
+            chain = self.impact.model(e.old).scope(line)
+            return any(isinstance(n, ast.ClassDef) for n in chain) and not any(isinstance(n, FUNCTION) for n in chain)
+        extended = (all(e.touched and all(class_value(e, line) for line in e.touched) for e in edits)
+                    or bool(re.search(r"^[-+].*\bcopy=(True|False)", text, re.M)))
+        nodes = []
+        if (total <= 650 and len(numbers) <= 45) or (extended and total <= 6000 and len(numbers) <= 100):
+            nodes = [names[n] for n in sorted(numbers, key=times.get)
+                     if extended or names[n].startswith("tests/dialects/")]
+        if self.fixtures and total < 12000:
+            slices = self.fixtures.fixture_plan(self.impact, edits, [names[n] for n in numbers])
+            cases.update(slices)
+            if slices and sum(times[n] for n in numbers if names[n] not in slices) < 1100:
+                nodes.extend(names[n] for n in numbers)
+        nodes = list(dict.fromkeys([*cases, *nodes]))
+        if not nodes:
+            return numbers
+        potential = set(nodes)
+        floor = [n for n in numbers if names[n] not in potential]
+        gain = schedule_cost(numbers, times) - schedule_cost(floor, times)
+        remaining = deadline - time.monotonic()
+        if gain < 450 or remaining < 0.35:
+            return numbers
+        timeout = min(remaining, 4.5 if cases or total > 650 else 1.75)
+        passed = verify(self.impact.source, edits, nodes, cases, timeout)
+        return [n for n in numbers if names[n] not in passed]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path("/data"))
@@ -414,23 +509,21 @@ def main():
     times = {row["number"]: round(row["seconds"] * 1000) for row in tests}
     names = {t["number"]: t["id"] for t in tests}
     patches = sorted((args.data / "commits").glob("*.patch"))
-    budget = min(16.0, len(patches) * 0.28)
+    verifier = Verifier(args.index, impact, names, times) if args.replay else None
+    budget = min(48.0, max(12.0, len(patches) * 0.8))
     for patch in patches:
         try:
             text = patch.read_text(encoding="utf-8")
+            start = time.monotonic()
+            if budget < 0.5:
+                impact.state = None
             numbers = impact.choose(text)
-            if (args.replay and budget > 0.5 and 0 < len(numbers) <= 45
-                    and sum(times[n] for n in numbers) <= 650
-                    and all(names[n].startswith("tests/dialects/") for n in numbers)):
-                start = time.monotonic()
+            if verifier and numbers and budget > 0.5:
                 try:
-                    edits = parse_patch(text)
-                    if all_pass(args.source, edits, [names[n] for n in sorted(numbers, key=times.get)],
-                                min(budget, 1.75)):
-                        numbers = []
-                except (OSError, ValueError, RecursionError):
+                    numbers = verifier.refine(numbers, text, start + budget)
+                except (OSError, ValueError, RecursionError, SyntaxError):
                     pass
-                budget -= time.monotonic() - start
+            budget -= time.monotonic() - start
         except UnicodeError:
             numbers = list(times)
         print(json.dumps({"commit": patch.stem, "workers": schedule(numbers, times)}, separators=(",", ":")))

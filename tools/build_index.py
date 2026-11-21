@@ -7,7 +7,6 @@ import importlib
 import inspect
 import json
 import os
-import pickle
 from pathlib import Path
 import subprocess
 import sys
@@ -17,24 +16,10 @@ from functools import cache
 
 from operand_types import TypeCoverage
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from replay import InlinePool
+
 PIN = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
-
-
-class InlinePool(futures.Executor):
-    """Keep fixture queries submitted to process pools in the tracing process."""
-    def __init__(self, *args, initializer=None, initargs=(), **kwargs):
-        if initializer:
-            initializer(*initargs)
-
-    def submit(self, fn, /, *args, **kwargs):
-        result = futures.Future()
-        try:
-            work, a, kw = pickle.loads(pickle.dumps((fn, args, kwargs)))
-            value = work(*a, **kw)
-            result.set_result(pickle.loads(pickle.dumps(value)))
-        except Exception as error:
-            result.set_exception(error)
-        return result
 
 
 class Recorder:

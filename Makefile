@@ -36,3 +36,7 @@ sample-native: $(KIT)/score.py
 index: $(KIT)/score.py
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_index.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/coverage.json
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_profiles.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/profiles.json
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_dialect_state.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/dialect-state.json.gz
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_query_index.py "$(SOURCE)" maps/queries.json.gz
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_checkpoints.py "$(SOURCE)" maps
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_optimizer_fixtures.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/optimizer-fixtures.json.gz

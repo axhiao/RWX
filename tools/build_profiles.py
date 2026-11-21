@@ -46,7 +46,15 @@ class ValueReads(dict):
             self.profile.read(site)
 
     def items(self):
-        self.all_values()
+        # Expr builds required_args by collecting the True-valued keys.
+        # Preserve their origins until validation examines a missing argument.
+        caller = sys._getframe(1)
+        if (caller.f_globals.get("__name__") == "sqlglot.expressions.core"
+                and caller.f_code.co_qualname == "Expr.__init_subclass__"
+                and caller.f_locals["cls"].arg_types is self):
+            self.profile.required[caller.f_locals["cls"]] = dict(self.origins)
+        else:
+            self.all_values()
         return super().items()
 
     def values(self):
@@ -195,6 +203,7 @@ def safe_scalar(value):
 
 class Profile:
     def __init__(self):
+        self.required = {}
         self.entries = {}
         self.observed = set()
         self.opaque = set()
@@ -309,7 +318,20 @@ def main():
     builtins._blast_scalar = profile.scalar
     sys.meta_path.insert(0, SQLGlotFinder(ProfileProbe, ("sqlglot", "tests")))
     concurrent.futures.ProcessPoolExecutor = InlinePool
+    from sqlglot import exp
     from sqlglot.dialects import Dialect, Dialects
+    original_errors = exp.Expression.error_messages
+    def trace_validation(expression, *args, **kwargs):
+        origins = profile.required.get(type(expression))
+        if origins:
+            missing = {key for key in origins if expression.args.get(key) is None
+                       or isinstance(expression.args[key], list) and not expression.args[key]}
+            # A changed required set can reorder other validation errors.
+            watch = origins if missing & expression.required_args else missing
+            for key in watch:
+                profile.read(origins[key])
+        return original_errors(expression, *args, **kwargs)
+    exp.Expression.error_messages = trace_validation
     # Resolve lazy startup caches before attaching observations to one test.
     for name in Dialects:
         d = Dialect.get_or_raise(name)
