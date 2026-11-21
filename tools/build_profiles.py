@@ -8,13 +8,15 @@ from functools import lru_cache
 import importlib
 import json
 import os
+import operator
 from pathlib import Path
 import subprocess
 import sys
 import unittest
 
 from build_index import InlinePool, PIN
-from operand_types import SQLGlotFinder
+from operand_types import SQLGlotFinder, type_category
+from comparison_relations import OPS
 
 
 class ValueReads(dict):
@@ -82,12 +84,14 @@ class ValueReads(dict):
         return super().__repr__()
 
     def __or__(self, other):
+        if type(other) is dict or isinstance(other, ValueReads):
+            return self.profile.table([(self,), (other,)])
         self.all_values()
-        if isinstance(other, ValueReads):
-            other.all_values()
         return super().__or__(other)
 
     def __ror__(self, other):
+        if type(other) is dict:
+            return self.profile.table([(other,), (self,)])
         self.all_values()
         return super().__ror__(other)
 
@@ -103,6 +107,10 @@ class ValueReads(dict):
         key, value = super().popitem()
         self.profile.read(self.origins.get(key))
         return key, value
+
+
+RELATION_OPS = {"eq": operator.eq, "ne": operator.ne, "lt": operator.lt, "le": operator.le,
+                "gt": operator.gt, "ge": operator.ge, "is": operator.is_, "isnot": operator.is_not}
 
 
 CMP = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
@@ -170,8 +178,20 @@ class ProfileProbe(ast.NodeTransformer):
             return ast.copy_location(call, node)
         return node
 
+    def visit_Expr(self, node):
+        self.generic_visit(node)
+        call = node.value
+        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "pop" and not call.keywords):
+            call.args.insert(0, call.func)
+            call.func = ast.copy_location(ast.Name("_blast_discard_pop", ast.Load()), call.func)
+        return node
+
     def visit_Call(self, node):
         self.generic_visit(node)
+        if isinstance(node.func, ast.Name) and node.func.id == "dict" and len(node.args) == 1 and not node.keywords:
+            node.args.insert(0, node.func)
+            node.func = ast.copy_location(ast.Name("_blast_copy_mapping", ast.Load()), node.func)
         if isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) in (2, 3):
             node.func = ast.copy_location(ast.Name("_blast_getattr", ast.Load()), node.func)
         return node
@@ -185,6 +205,12 @@ class ProfileProbe(ast.NodeTransformer):
                 site = f"{self.path}:{node.lineno}:{node.col_offset}"
                 call = ast.Call(ast.Name("_blast_scalar", ast.Load()), [ast.Constant(site), node.left], [])
                 node.left = ast.copy_location(call, node.left)
+        if len(node.ops) == 1 and type(node.ops[0]) in OPS:
+            site = f"{self.path}:{node.lineno}:{node.col_offset}"
+            call = ast.Call(ast.Name("_blast_relation", ast.Load()), [
+                ast.Constant(site), ast.Constant(OPS[type(node.ops[0])]), node.left, node.comparators[0]
+            ], [])
+            return ast.copy_location(call, node)
         return node
 
 
@@ -208,6 +234,9 @@ class Profile:
         self.observed = set()
         self.opaque = set()
         self.scalars = defaultdict(dict)
+        self.relations = defaultdict(dict)
+        self.relation_seen = set()
+        self.relation_cold = set()
         self.samples = {}
         self.active = False
         self.field_reads = {}
@@ -267,6 +296,25 @@ class Profile:
                 table.origins[key] = site
         return table
 
+    def relation(self, site, op, a, b):
+        if self.active:
+            left, right = type(a), type(b)
+            state = "?"
+            if ((left in (int, bool, float) and right in (int, bool, float))
+                    or left is right and left in (str, bytes)):
+                # NaN has neither ordering nor equality.
+                relation = "=" if a == b else "<" if a < b else ">" if a > b else "unordered"
+                state = ("1" if a is b else "0") + relation
+            elif ((a is None and type_category(right) != "other")
+                  or (b is None and type_category(left) != "other")
+                  or type_category(left) == type_category(right) == "identity"
+                  or left is right and type_category(left).startswith("enum:")):
+                state = ("1equal" if a is b else "0different")
+            self.relation_seen.add((site, state))
+        else:
+            self.relation_cold.add(site)
+        return RELATION_OPS[op](a, b)
+
     def scalar(self, site, value):
         if self.active:
             values = self.samples.setdefault(site, set())
@@ -285,6 +333,10 @@ class Profile:
         for field in self.field_seen:
             self.field_reads[field] = self.field_reads.get(field, 0) | mask
         self.field_seen.clear()
+        for site, state in self.relation_seen:
+            rows = self.relations[site]
+            rows[state] = rows.get(state, 0) | mask
+        self.relation_seen.clear()
         for site in self.observed:
             self.entries[site] |= mask
         for site, values in self.samples.items():
@@ -312,10 +364,26 @@ def main():
     sys.path.insert(0, str(root))
     profile = Profile()
     ProfileProbe.fields = configuration_fields(root)
+    def copy_mapping(constructor, source):
+        if constructor is dict and isinstance(source, ValueReads):
+            return source.copy()
+        return constructor(source)
+
+    def discard_pop(method, *args):
+        source = getattr(method, "__self__", None)
+        if isinstance(source, ValueReads) and args:
+            dict.pop(source, *args)
+            source.origins.pop(args[0], None)
+        else:
+            method(*args)
+
+    builtins._blast_copy_mapping = copy_mapping
+    builtins._blast_discard_pop = discard_pop
     builtins._blast_getattr = profile.lookup
     builtins._blast_field = profile.field
     builtins._blast_table = profile.table
     builtins._blast_scalar = profile.scalar
+    builtins._blast_relation = profile.relation
     sys.meta_path.insert(0, SQLGlotFinder(ProfileProbe, ("sqlglot", "tests")))
     concurrent.futures.ProcessPoolExecutor = InlinePool
     from sqlglot import exp
@@ -375,7 +443,9 @@ def main():
     entries = {s: intern(m) for s, m in sorted(profile.entries.items()) if s not in profile.opaque}
     scalars = {s: {v: intern(m) for v, m in sorted(rows.items())} for s, rows in sorted(profile.scalars.items())}
     fields = {site: intern(m) for site, m in sorted(profile.field_reads.items()) if site not in profile.cold_fields}
-    data = dict(fields=fields, commit=PIN, tests=names, complete=intern(complete), entries=entries,
+    relations = {s: {v: intern(m) for v, m in sorted(rows.items())}
+                 for s, rows in sorted(profile.relations.items()) if s not in profile.relation_cold}
+    data = dict(relations=relations, fields=fields, commit=PIN, tests=names, complete=intern(complete), entries=entries,
                 scalars=scalars, masks=[format(n, "x") for n in masks])
     temp = output.with_suffix(".tmp")
     temp.write_text(json.dumps(data, separators=(",", ":")) + "\n")

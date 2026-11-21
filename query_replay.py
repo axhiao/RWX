@@ -8,6 +8,7 @@ class QueryCoverage:
     def __init__(self, path):
         with gzip.open(path, "rt") as stream:
             data = json.load(stream)
+        self.parser_calls = data.get("cases", [])
         self.methods = data.get("methods", {})
         self.ranges = data.get("ranges", {})
         masks = [int(m, 16) for m in data["masks"]]
@@ -69,3 +70,16 @@ class QueryCoverage:
             if count <= 40 and count * 3 <= size:
                 result[node] = keep
         return result
+
+
+    def parser_plan(self, impact, edits):
+        supported = {"sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py"}
+        if not all(e.old in supported or e.old.startswith("sqlglot/parsers/") for e in edits):
+            return None
+        affected = self.affected(impact, edits)
+        if affected is None or affected & 1:
+            return None
+        live = [i for i in range(len(self.parser_calls)) if affected & (1 << (i + 1))]
+        if sum(self.parser_calls[i]["cost"] for i in live) > 1200:
+            return None
+        return {"parse_calls": self.parser_calls, "live": live}

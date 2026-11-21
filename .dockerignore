@@ -13,3 +13,9 @@
 !maps/call-inputs.json.gz
 !maps/call-sites.json.gz
 !maps/optimizer-fixtures.json.gz
+!shared_fixtures.py
+!maps/parser-cases.json.gz
+!maps/shared-fixtures.json
+!expression_coverage.py
+!maps/expressions.json.gz
+!comparison_relations.py

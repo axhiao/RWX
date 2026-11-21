@@ -4,16 +4,18 @@ A test selector for the [Builders Blast Radius track](https://www.joinbuilders.o
 
 ## Results
 
-The submitted revision `684aa7b` scored **228.6 s** on the hidden practice batch. The table compares simulated seconds on patches for which the expected failures are available locally.
+The latest reported hidden practice score before this change was **222 s**, with a target below **130.7 s**. The local comparison starts at repository revision `723c312`. The new hidden score requires a submission.
 
-| Batch | Patches | `684aa7b` | Current selector |
+| Local batch | Patches | Previous simulated seconds | New simulated seconds |
 | --- | ---: | ---: | ---: |
-| Official public sample | 30 | 97.144 | 94.373 |
-| Dialect settings, dispatch and comparisons, first seed | 8 | 66.553 | 37.015 |
-| Same mutation generator, independent second seed | 8 | 23.061 | 13.662 |
-| Optimizer copy flags, branches and comparisons | 6 | 66.285 | 41.723 |
+| Official public sample | 30 | 94.373 | 94.373 |
+| Earlier dialect and optimizer mutations | 22 | 92.400 | 92.400 |
+| Shared fixtures and parser branches | 6 | 140.689 | 44.488 |
+| Random generator dispatch entries | 3 | 110.451 | 6.522 |
+| Random comparisons inside short-circuit expressions | 4 | 15.846 | 11.539 |
+| All patches in one batch | 65 | 453.759 | 249.322 |
 
-Both revisions covered every failing test on these 52 patches. With all 52 patches delivered in one batch on native macOS, the median total over three runs, including CPU, fell from 255.843 s to 206.406 s. The current batch used 186.773 simulated seconds. The Linux/amd64 Docker public sample reported 94.373 simulated seconds with zero misses. Each additional patch was labeled by a separate run of the full pinned SQLGlot pytest suite. The official scorer charges the selector's CPU time in addition to simulated seconds. The live verifier uses a time budget, so machine speed and batch composition can affect both. A new hidden practice score requires a competition run.
+Each additional patch was labeled by running the full pinned SQLGlot pytest suite separately. Multiline subtest names and errors loading whole test modules are included in the label audit. Both selectors covered every failing test in the combined batch. The new cases deliberately exercise specific parts of SQLGlot. Their frequencies on the hidden batch are unknown. The official scorer also charges all selector and child-process CPU time. The median local total over three native macOS runs was 473.205 s for the previous version and 272.264 s for this version.
 
 ## Run
 
@@ -42,7 +44,9 @@ python3.13 -m unittest discover -s tests -v
 4. The value profile records reads of individual dictionary entries, concrete configuration fields and scalar comparison operands. It preserves value origins across dictionary spreads. Unresolved import-time reads and unobserved operand types retain conservative coverage. Structural AST checks verify that the refined changes account for the entire edit.
 5. For string-valued dialect tables, the index traces keyed lookups on the effective maps and sets after metaclass initialization. At runtime, a fresh process initializes the patched dialects. The selector compares their forward tables, inverse tables and tries, and selects the tests that observed a changed value, membership, length or iteration result. Expression argument declarations also carry their origins into validation of missing required arguments.
 6. The verifier executes selected tests in an isolated overlay of the patched source. It can limit a large fixture-based method to the SQL pairs that reached a changed function body. For TPC-DS it can also compare the outputs of affected parser, optimizer, transpiler and Python-generator calls on recorded pristine inputs. If a call differs, the verifier checks the original assertions for the corresponding queries when they fit the budget. Failed checks, skipped tests, unavailable dependencies and timeouts retain candidates. All worker tasks executed inline still serialize their arguments and results. Running without `--replay` selects tests using static analysis and baseline coverage only.
-7. The scheduler tries one through eight workers, assigning the longest tests first. It minimizes the largest assigned load plus 2,000 milliseconds per worker among the candidate schedules. Test IDs are mapped to the numbers in the current input catalog.
+7. A separate baseline trace records entry into individual expressions, including operands guarded by short-circuit evaluation. Each test module is also imported in a fresh interpreter. The trace only narrows substitutions it can align structurally. Missing or opaque observations retain the existing bound. The value profile follows dictionary copies into generator dispatch caches and records scalar ordering and identity at comparisons.
+8. For shared TPC fixtures, the verifier compares the original and changed rows using the upstream loader and follows the lists actually read by each test. Malformed fixture metadata retains the candidates that depend on class setup. For the parser node-limit test, baseline traces distinguish its six calls. The verifier checks each input and option, invokes the affected calls, and verifies the original unit test's assertions.
+9. The scheduler tries one through eight workers, assigning the longest tests first. It minimizes the largest assigned load plus 2,000 milliseconds per worker among the candidate schedules. Test IDs are mapped to the numbers in the current input catalog.
 
 Coverage describes behavior on the base revision. New execution paths, environment differences and previously unseen inputs can change which tests fail.
 

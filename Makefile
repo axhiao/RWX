@@ -40,3 +40,6 @@ index: $(KIT)/score.py
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_query_index.py "$(SOURCE)" maps/queries.json.gz
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_checkpoints.py "$(SOURCE)" maps
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_optimizer_fixtures.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/optimizer-fixtures.json.gz
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_parser_cases.py "$(SOURCE)" maps/parser-cases.json.gz
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_shared_fixtures.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/shared-fixtures.json
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/build_expression_coverage.py "$(SOURCE)" "$(SAMPLE)/tests.json" maps/expressions.json.gz

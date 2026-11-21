@@ -1,7 +1,8 @@
 """Verify small candidate groups in an isolated checkout of the patched code."""
 import concurrent.futures as futures
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import gzip
+import hashlib
 import importlib
 import json
 import os
@@ -97,9 +98,10 @@ def overlay(base, target, changes):
 def checkout(source, edits):
     changes = {}
     for edit in edits:
-        if (not edit.old.startswith("sqlglot/") or not edit.old.endswith(".py")
-                or edit.old != edit.new):
-            raise ValueError("verification requires modified production Python files")
+        code = edit.old.startswith("sqlglot/") and edit.old.endswith(".py")
+        fixture = edit.old.startswith("tests/fixtures/") and edit.old.endswith(".sql")
+        if edit.old != edit.new or not (code or fixture):
+            raise ValueError("unsupported overlay file")
         tree = changes
         *dirs, name = Path(edit.old).parts
         for directory in dirs:
@@ -216,6 +218,36 @@ def child(script, root, env, extra, timeout):
         return False
 
 
+@contextmanager
+def parser_inputs(module, selection):
+    from sqlglot import serde
+    from sqlglot.errors import ParseError
+    original = module.parse_one
+    records, live = selection["parse_calls"], set(selection["live"])
+    count = 0
+
+    def parse(sql, **opts):
+        nonlocal count
+        index = count
+        count += 1
+        record = records[index]
+        if hashlib.sha256(sql.encode()).hexdigest() != record["sql"] or opts != record["opts"]:
+            raise ValueError("unexpected parser input")
+        if index in live:
+            return original(sql, **opts)
+        if "error" in record:
+            raise ParseError(record["error"], record["details"])
+        return serde.load(record["tree"])
+
+    module.parse_one = parse
+    try:
+        yield
+        if count != len(records):
+            raise ValueError("incomplete parser input sequence")
+    finally:
+        module.parse_one = original
+
+
 def _run_tests_in_process(nodes, cases):
     groups = {}
     for node in nodes:
@@ -237,7 +269,10 @@ def _run_tests_in_process(nodes, cases):
                     selection = cases.get(node)
                     fixture_module = None
                     field = None
-                    if isinstance(selection, dict):
+                    calls = nullcontext()
+                    if isinstance(selection, dict) and "parse_calls" in selection:
+                        calls = parser_inputs(sys.modules[cls.__module__], selection)
+                    elif isinstance(selection, dict):
                         fixture_module = sys.modules[cls.__module__]
                         loader = fixture_module.load_sql_fixture_pairs
                         def load_subset(filename):
@@ -257,7 +292,8 @@ def _run_tests_in_process(nodes, cases):
                     try:
                         result = unittest.TestResult()
                         result.failfast = True
-                        cls(method).run(result)
+                        with calls:
+                            cls(method).run(result)
                         if (result.testsRun == 1 and result.wasSuccessful() and not
                                 (result.skipped or result.expectedFailures)):
                             group_passes.append(node)
@@ -301,6 +337,25 @@ def changed_queries(source, edits, data, calls, costs, timeout):
                  [data.resolve(), request, receipt], timeout):
             return json.loads(receipt.read_bytes())
         return None
+
+
+def verify_fixtures(source, edits, nodes, shared, optimizer, timeout):
+    import shared_fixtures
+    paths = [e.old.removeprefix("tests/fixtures/") for e in edits]
+    source = source.resolve()
+    with checkout(source, edits) as (root, env):
+        if hasattr(os, "fork"):
+            def run():
+                passed, cases = shared_fixtures.plans(source, paths, nodes, shared, optimizer)
+                passed.extend(_run_tests_in_process(list(cases), cases))
+                return passed
+            ok, passed = _fork_run(root, run, timeout)
+            return set(passed) if ok else set()
+        request, receipt = root.parent / "fixtures.json", root.parent / "passed"
+        request.write_text(json.dumps([str(source), paths, nodes, shared, optimizer]))
+        if child(Path(__file__).with_name("shared_fixtures.py"), root, env, [request, receipt], timeout):
+            return set(json.loads(receipt.read_bytes()))
+    return set()
 
 
 def verify_commit(source, edits, nodes, cases, timeout, tpcds_check=None):

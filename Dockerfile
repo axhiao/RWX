@@ -12,7 +12,7 @@ COPY --from=source /src/ /opt/sqlglot/
 WORKDIR /app
 RUN python -m pip install --no-cache-dir python-dateutil==4.0.0 pytz==2026.6 tzdata==2026.6 typing_extensions==4.16.0 duckdb==2.0.0 pandas==3.1.1 numpy==2.5.5 \
  && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests
-COPY selector.py value_profiles.py replay.py dialect_state.py query_replay.py checkpoints.py ./
-COPY maps/coverage.json maps/profiles.json maps/dialect-state.json.gz maps/queries.json.gz maps/call-inputs.json.gz maps/call-sites.json.gz maps/optimizer-fixtures.json.gz maps/
+COPY selector.py value_profiles.py replay.py dialect_state.py query_replay.py checkpoints.py shared_fixtures.py expression_coverage.py comparison_relations.py ./
+COPY maps/coverage.json maps/profiles.json maps/dialect-state.json.gz maps/queries.json.gz maps/call-inputs.json.gz maps/call-sites.json.gz maps/optimizer-fixtures.json.gz maps/parser-cases.json.gz maps/shared-fixtures.json maps/expressions.json.gz maps/
 USER 65534:65534
 ENTRYPOINT ["python", "/app/selector.py", "--replay"]

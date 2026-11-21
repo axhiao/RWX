@@ -11,12 +11,13 @@ import json
 from pathlib import Path
 import re
 import time
-from replay import verify_commit, patched_state, warmup
+from replay import verify_commit, verify_fixtures, patched_state, warmup
 from checkpoints import Checkpoints, TPCDS
 from dialect_state import StateCoverage, eligible
 from query_replay import QueryCoverage
 
 from value_profiles import Profiles
+from expression_coverage import ExpressionCoverage
 
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -184,6 +185,8 @@ class Impact:
             self.all |= 1 << idx
         self.unmeasured = self.all & ~masks[data["complete"]]
         self.test_ids = data["tests"]
+        expression_map = index.with_name("expressions.json.gz")
+        self.precise = ExpressionCoverage(expression_map, self.test_ids) if expression_map.is_file() else None
         self.state = None
         profile_path = index.with_name("profiles.json")
         self.profiles = Profiles(profile_path, data["tests"], source) if profile_path.is_file() else None
@@ -358,10 +361,19 @@ class Impact:
             mask = self.state.impact(other) if other is not None else None
             if mask is not None:
                 return readers | mask | self.unmeasured | (self.all & ~self.state.complete)
+        exact = None
+        if self.precise and edit.touched and not edit.insertions:
+            exact = self.precise.impact(path, src.tree, changed, edit.touched)
+            if exact is not None:
+                exact |= readers | self.unmeasured
+                if not self.precise.includes_imports:
+                    cold = self.imports.get(path, {})
+                    exact |= union(cold.get(n, 0) for n in edit.touched)
         if self.profiles and edit.touched and not edit.insertions:
             measured = self.profiles.impact(path, src, changed, edit.touched, self.imports.get(path, {}))
             if measured is not None:
-                return readers | measured | self.unmeasured | (self.all & ~self.profiles.complete)
+                bound = readers | measured | self.unmeasured | (self.all & ~self.profiles.complete)
+                return bound if exact is None else bound & exact
         # Some built-in dialects parse SQL while being imported. Missing
         # required arguments there can prevent entire test modules loading.
         # A key with an unresolved cold read has no per-test validation bound.
@@ -384,7 +396,7 @@ class Impact:
             # Both sides matter at block boundaries.
             result |= self.line_impact(path, src, max(1, offset), True)
             result |= self.line_impact(path, src, offset + 1, True)
-        return result
+        return result if exact is None else result & exact
 
     def choose(self, patch):
         try:
@@ -438,6 +450,9 @@ class Verifier:
             path = index.with_name(name + ".json.gz")
             return reader(path) if path.is_file() else None
         self.checkpoints = read_optional("call-sites", Checkpoints) if self.inputs.is_file() else None
+        shared = index.with_name("shared-fixtures.json")
+        self.shared = json.loads(shared.read_bytes()) if shared.is_file() else {}
+        self.parser_queries = read_optional("parser-cases", QueryCoverage)
         self.queries = read_optional("queries", QueryCoverage)
         self.fixtures = read_optional("optimizer-fixtures", QueryCoverage)
         impact.state = read_optional("dialect-state", lambda p: StateCoverage(p, impact.test_ids))
@@ -457,10 +472,20 @@ class Verifier:
 
     def refine(self, numbers, text, deadline):
         edits = parse_patch(text)
+        if self.fixtures and all(e.old == e.new and e.old.startswith("tests/fixtures/")
+                                 and e.old.removeprefix("tests/fixtures/") in self.shared for e in edits):
+            passed = verify_fixtures(self.impact.source, edits, [self.names[n] for n in numbers],
+                                     self.shared, self.fixtures.ranges, min(4.5, deadline - time.monotonic()))
+            return [n for n in numbers if self.names[n] not in passed]
         if not all(e.old == e.new and e.old.startswith("sqlglot/") and e.old.endswith(".py") for e in edits):
             return numbers
         cases, tpcds_check = self.executor_plan(numbers, edits, deadline)
         times, names = self.times, self.names
+        parser_test = "tests/test_parser.py::TestParser::test_max_nodes"
+        if self.parser_queries and any(names[n] == parser_test for n in numbers):
+            selection = self.parser_queries.parser_plan(self.impact, edits)
+            if selection:
+                cases[parser_test] = selection
         total = sum(times[n] for n in numbers)
         # Class-table substitutions and copy flags can affect many callers
         # without changing their assertions. Their inexpensive groups are

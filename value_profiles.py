@@ -3,6 +3,7 @@ import ast
 from functools import lru_cache
 import json
 import operator
+from comparison_relations import OPS, changed_mask
 
 
 COMPARE = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
@@ -44,6 +45,8 @@ class Profiles:
         if data["tests"] != names:
             raise ValueError("coverage and value profiles use different test IDs")
         masks = [int(m, 16) for m in data["masks"]]
+        self.relations = data.get("relations", {})
+        self.masks = masks
         self.fields = {s: masks[m] for s, m in data.get("fields", {}).items()}
         self.entries = {site: masks[m] for site, m in data["entries"].items()}
         self.scalars = {site: {v: masks[m] for v, m in rows.items()}
@@ -89,6 +92,11 @@ class Profiles:
         return False
 
     def compare(self, site, old, new, cold):
+        if (site in self.relations and len(old.ops) == len(new.ops) == 1
+                and type(old.ops[0]) in OPS and type(new.ops[0]) in OPS
+                and type(old.ops[0]) is not type(new.ops[0]) and equal(old.left, new.left)
+                and equal(old.comparators[0], new.comparators[0])):
+            return cold | changed_mask(self.relations[site], old.ops[0], new.ops[0], self.masks)
         if (len(old.ops) != 1 or len(new.ops) != 1 or type(old.ops[0]) not in COMPARE
                 or type(new.ops[0]) not in COMPARE or not equal(old.left, new.left)):
             return None
